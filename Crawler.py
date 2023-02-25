@@ -5,6 +5,7 @@ import html.parser
 import pathlib
 import time
 import urllib.parse
+import pandas as pd
 from typing import Callable, Iterable
 
 import httpx  # https://github.com/encode/httpx
@@ -16,10 +17,12 @@ class UrlFilterer:
             allowed_domains: set[str] | None = None,
             allowed_schemes: set[str] | None = None,
             allowed_filetypes: set[str] | None = None,
+            blocked_phrases: set[str] | None = None,
     ):
         self.allowed_domains = allowed_domains
         self.allowed_schemes = allowed_schemes
         self.allowed_filetypes = allowed_filetypes
+        self.blocked_phrases = blocked_phrases
 
     def filter_url(self, base: str, url: str) -> str | None:
         url = urllib.parse.urljoin(base, url)
@@ -34,6 +37,9 @@ class UrlFilterer:
         ext = pathlib.Path(parsed.path).suffix
         if (self.allowed_filetypes is not None
                 and ext not in self.allowed_filetypes):
+            return None
+        if (self.blocked_phrases is not None
+            and any([p in url for p in self.blocked_phrases])):
             return None
         return url
 
@@ -61,6 +67,37 @@ class UrlParser(html.parser.HTMLParser):
             if (url := self.filter_url(self.base, url)) is not None:
                 self.found_links.add(url)
 
+
+class SpellParser(html.parser.HTMLParser):
+    def __init__(self) -> None:
+        self.name = ""
+        self.description =""
+        self.capture_desc = False
+        self.capture_name = False
+        super().__init__()
+
+    def handle_endtag(self, tag):
+        if tag not in ('div', 'h1'):
+            return
+
+        self.capture_desc = False
+        self.capture_name = False
+
+    def handle_data(self, data: str) -> None:
+        if self.capture_name:
+            self.name = data.strip()
+        elif self.capture_desc:
+            self.description = data.strip()
+           
+    def handle_starttag(self, tag, attrs) -> None:
+        if tag not in ('div', 'h1'):
+            return
+
+        if ('class','codex-page-description') in attrs:
+            self.capture_desc = True
+        elif ('class', 'herotext') in attrs:
+            self.capture_name = True
+        
 
 class Crawler:
     def __init__(
@@ -114,7 +151,7 @@ class Crawler:
     async def crawl(self, url: str):
 
         # rate limit here...
-        await asyncio.sleep(.1)
+        await asyncio.sleep(.2)
 
         response = await self.client.get(url, follow_redirects=True)
 
@@ -137,32 +174,92 @@ class Crawler:
         self.seen.update(new)
 
         # await save to database or file here...
-
+       
         for url in new:
             await self.put_todo(url)
 
     async def put_todo(self, url: str):
         if self.total >= self.limit:
             return
+        if '?p=' not in url:
+            return
+
         self.total += 1
         await self.todo.put(url)
 
+
+def save_spell_urls(spells):
+    with open(r'spell_urls.txt', 'w') as fp:
+        for url in spells:
+            # write each item on a new line
+            fp.write("%s\n" % url)
+
+
+class SpellReader(Crawler):
+    def __init__(self, client: httpx.AsyncClient, urls: Iterable[str], langs: Iterable[str], workers: int = 10, ):#
+        self.langs = langs
+        self.entries = []
+        super().__init__(client, urls, None, workers, limit=len(urls))
+
+
+    async def parse_spell_info(self, text: str) -> set[str]:
+        parser = SpellParser()
+        parser.feed(text)
+        return parser.name, parser.description
+
+    async def crawl(self, url):
+        await asyncio.sleep(.2)
+
+        df = pd.DataFrame()
+        df['url'] = [url]
+        for lang in self.langs:
+            response = await self.client.get(f"{url}?lang={lang}", follow_redirects=True)
+            name, desc = await self.parse_spell_info(response.text)
+            df[f'name_{lang}'] = name
+            df[f'desc_{lang}'] = desc
+
+        self.entries.append(df)
+        pass
+
+    async def put_todo(self, url: str):
+        if self.total >= self.limit:
+            return
+
+        self.total += 1
+        await self.todo.put(url)
+
+async def get_spells(spell_urls, langs):
+    start = time.perf_counter()
+    async with httpx.AsyncClient() as client:
+        crawler = SpellReader(
+            client=client,
+            urls=spell_urls,
+            workers=5,
+            langs = langs
+        )
+        await crawler.run()
+    end = time.perf_counter()
+    print(f"Done in {end - start:.2f}s")
+    df = pd.concat(crawler.entries).sort_values('name_en')
+    return df
 
 async def main():
     filterer = UrlFilterer(
         allowed_domains={"playorna.com"},
         allowed_schemes={"http", "https"},
         allowed_filetypes={".html", ".php", ""},
+        blocked_phrases={ "lang","releases/"}
     )
 
     start = time.perf_counter()
     async with httpx.AsyncClient() as client:
         crawler = Crawler(
             client=client,
-            urls=["https://playorna.com/codex/spells/"],
+            urls=["https://playorna.com/codex/spells/",
+                  ],
             filter_url=filterer.filter_url,
             workers=5,
-            limit=25,
+            limit=250,
         )
         await crawler.run()
     end = time.perf_counter()
@@ -174,6 +271,15 @@ async def main():
     print(f"Crawled: {len(crawler.done)} URLs")
     print(f"Found: {len(seen)} URLs")
     print(f"Done in {end - start:.2f}s")
+
+    spell_urls = [s for s in seen if 'spells' in s and 'lang' not in s]
+    spell_urls.sort()
+
+    langs = ['en', 'de']
+
+    df = await get_spells(spell_urls, langs)
+    df.to_csv('skills.csv')
+    pass
 
 
 if __name__ == '__main__':
